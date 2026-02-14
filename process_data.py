@@ -1,7 +1,6 @@
 import xarray as xr
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
-import cartopy.feature as cfeature
 import numpy as np
 import os
 
@@ -11,24 +10,26 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def process_band(dataset, variable_name, output_filename, colormap, vmin=None, vmax=None):
     """
-    Decodes a GRIB2 variable and saves it as a transparent PNG for the web map.
+    Decodes a variable and saves it as a transparent PNG.
     """
     try:
-        # Select the variable
+        if variable_name not in dataset:
+            print(f"Skipping {output_filename}: Variable '{variable_name}' not found.")
+            return
+
         data = dataset[variable_name]
         
-        # Setup the plot with a transparent background for the web map
+        # Setup the plot
         fig = plt.figure(figsize=(10, 10), frameon=False)
         ax = plt.axes(projection=ccrs.PlateCarree())
-        ax.set_extent([-100, -60, 20, 50]) # Focus on US East Coast/Atlantic (Adjust as needed)
+        ax.set_extent([-125, -65, 25, 50]) # Continental US View
         
-        # Remove axes and borders so we just get the data overlay
+        # Remove axes and borders
         ax.outline_patch.set_visible(False)
         ax.background_patch.set_visible(False)
         plt.axis('off')
 
-        # Plot the data
-        # Note: GRIB2 coordinates can vary. Ensure lat/lon are correctly mapped.
+        # Plot data
         data.plot.pcolormesh(
             ax=ax, 
             transform=ccrs.PlateCarree(), 
@@ -38,46 +39,53 @@ def process_band(dataset, variable_name, output_filename, colormap, vmin=None, v
             add_colorbar=False
         )
 
-        # Save as PNG with transparent background
         output_path = os.path.join(OUTPUT_DIR, output_filename)
         plt.savefig(output_path, transparent=True, bbox_inches='tight', pad_inches=0, dpi=100)
         plt.close()
         print(f"Generated {output_filename}")
         
-    except KeyError:
-        print(f"Variable {variable_name} not found in GRIB2 file.")
+    except Exception as e:
+        print(f"Error generating {output_filename}: {e}")
 
 def main():
-    # 1. DOWNLOAD GRIB2 DATA
-    # For this example, we assume a file 'latest_goes.grib2' exists.
-    # In production, use boto3 or requests to fetch from NOAA/NCEP.
-    # Example: specific forecast model or satellite derived product in GRIB2
-    grib_file = 'latest_goes.grib2' 
+    grib_file = 'latest_goes.grib2'
     
     if not os.path.exists(grib_file):
-        print("No GRIB2 file found. Skipping processing (Add download logic here).")
+        print("No GRIB2 file found.")
         return
 
-    # 2. DECODE DATA
-    # We use cfgrib engine which relies on eccodes
-    ds = xr.open_dataset(grib_file, engine='cfgrib')
+    # --- 1. LOAD SURFACE DATA ---
+    # We explicitly ask for 'surface' to fix the "multiple values" error
+    try:
+        print("Loading Surface Level...")
+        ds_surface = xr.open_dataset(
+            grib_file, 
+            engine='cfgrib', 
+            backend_kwargs={'filter_by_keys': {'typeOfLevel': 'surface'}}
+        )
 
-    # 3. GENERATE IMAGES
-    
-    # INFRARED (Band 13 equivalent)
-    # Variable names depend on your specific GRIB2 source. 
-    # Common names: 'tcc' (Cloud Cover), 't' (Temperature), or specific GOES codes.
-    # Here we assume a Brightness Temperature variable exists.
-    process_band(ds, 't', 'infrared.png', 'gray_r', vmin=200, vmax=300)
+        # 'vis' = Visibility (Proxy for Visible Satellite)
+        process_band(ds_surface, 'vis', 'blue_visible.png', 'Blues_r')
+        
+        # 't' = Temperature (Proxy for Infrared)
+        process_band(ds_surface, 't', 'infrared.png', 'gray_r', vmin=240, vmax=310)
+    except Exception as e:
+        print(f"Could not process Surface level: {e}")
 
-    # BLUE VISIBLE (Band 1 equivalent)
-    # Often 'vis' or similar in GRIB2
-    process_band(ds, 'vis', 'blue_visible.png', 'Blues_r')
-
-    # GEOCOLOR (Synthetic)
-    # Real GeoColor is complex. We approximate by overlaying visible on IR or using a custom cmap.
-    # If your GRIB contains specific RGB composite channels, use them here.
-    process_band(ds, 'r', 'geocolor.png', 'terrain') 
+    # --- 2. LOAD ATMOSPHERE DATA ---
+    # We open the file AGAIN to get the 'atmosphere' level (for clouds)
+    try:
+        print("Loading Atmosphere Level...")
+        ds_atmos = xr.open_dataset(
+            grib_file, 
+            engine='cfgrib', 
+            backend_kwargs={'filter_by_keys': {'typeOfLevel': 'atmosphere'}}
+        )
+        
+        # 'tcc' = Total Cloud Cover (Proxy for GeoColor/Clouds)
+        process_band(ds_atmos, 'tcc', 'geocolor.png', 'gray')
+    except Exception as e:
+        print(f"Could not process Atmosphere level: {e}")
 
 if __name__ == "__main__":
     main()
