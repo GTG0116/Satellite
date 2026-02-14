@@ -1,0 +1,44 @@
+name: Update Satellite Data
+
+on:
+  schedule:
+    - cron: '0 * * * *' # Runs every hour
+  workflow_dispatch: # Allows manual trigger
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install System Dependencies (ecCodes)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeccodes-dev
+          
+      - name: Install Python Libraries
+        run: |
+          pip install -r requirements.txt
+
+      - name: Download Data
+        run: |
+          # Replace this with your actual GRIB2 source URL
+          # This example downloads a sample GFS file just to make the script run
+          wget "https://noaa-gfs-bdp-pds.s3.amazonaws.com/gfs.20230920/00/atmos/gfs.t00z.pgrb2.0p25.f000" -O latest_goes.grib2
+
+      - name: Process GRIB2 to Images
+        run: python process_data.py
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          force_orphan: true
