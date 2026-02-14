@@ -1,0 +1,7 @@
+xarray
+cfgrib
+matplotlib
+cartopy
+boto3
+scipy
+imageio
