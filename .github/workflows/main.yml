@@ -8,7 +8,7 @@ on:
   #   - cron: '0 * * * *'  # Commented out so it relies purely on cron-job.org
 
 permissions:
-  contents: write  # Needed to commit updated images back to the repo
+  contents: write  # Needed to force-push the gh-pages deployment branch
 
 jobs:
   update-satellite:
@@ -34,11 +34,23 @@ jobs:
       - name: Generate Satellite Images
         run: python process_data.py
 
-      - name: Commit and Push Images to Repository
+      - name: Deploy to GitHub Pages (force-push, no history accumulation)
         run: |
           git config user.name  "GitHub Actions Bot"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add site/data/
-          # Only commit if something actually changed
-          git diff --staged --quiet || git commit -m "chore: update satellite images [$(date -u '+%Y-%m-%d %H:%M UTC')]"
-          git push
+
+          # Copy the generated site out of the working tree before switching branches
+          DEPLOY_DIR=$(mktemp -d)
+          cp -r site/. "$DEPLOY_DIR/"
+
+          # Create a fresh orphan state — no parent commits, so history never grows.
+          # Force-pushing this to gh-pages replaces the previous single commit,
+          # keeping the branch at exactly one commit regardless of how many times
+          # the workflow runs.
+          git checkout --orphan gh-pages-deploy
+          git rm -rf . --quiet
+
+          cp -r "$DEPLOY_DIR/." .
+          git add .
+          git commit -m "deploy: $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push --force origin HEAD:gh-pages
