@@ -8,7 +8,7 @@ on:
   #   - cron: '0 * * * *'  # Commented out so it relies purely on cron-job.org
 
 permissions:
-  contents: write  # Needed to force-push the gh-pages deployment branch
+  contents: write
 
 jobs:
   update-satellite:
@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history needed to find the last source-only commit
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,22 +36,51 @@ jobs:
       - name: Generate Satellite Images
         run: python process_data.py
 
-      - name: Deploy to GitHub Pages (force-push, no history accumulation)
+      - name: Commit images to main (squash old data commits, keep one)
         run: |
           git config user.name  "GitHub Actions Bot"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Copy the generated site out of the working tree before switching branches
+          git add site/data/
+
+          # Skip if nothing changed
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          # Walk history to find the most recent commit whose tree does NOT contain
+          # site/data/ at all. That is the "clean" source baseline. Every data commit
+          # that accumulated on top of it will be squashed into one fresh commit.
+          CLEAN_BASE=""
+          for sha in $(git log --format="%H"); do
+            if ! git ls-tree --name-only -r "$sha" | grep -q "^site/data/"; then
+              CLEAN_BASE="$sha"
+              break
+            fi
+          done
+
+          if [ -n "$CLEAN_BASE" ]; then
+            # Soft-reset drops all prior data commits from the branch tip while
+            # preserving the staged index so nothing is lost.
+            git reset --soft "$CLEAN_BASE"
+          fi
+
+          git commit -m "chore: update satellite data [$(date -u '+%Y-%m-%d %H:%M UTC')]"
+
+          # Force-push replaces the old data commit with the new one.
+          # raw.githubusercontent.com/.../main/site/data/... keeps working.
+          git push --force origin HEAD:main
+
+      - name: Deploy website to GitHub Pages (force-push, no history)
+        run: |
+          # Save generated site before switching branches
           DEPLOY_DIR=$(mktemp -d)
           cp -r site/. "$DEPLOY_DIR/"
 
-          # Create a fresh orphan state — no parent commits, so history never grows.
-          # Force-pushing this to gh-pages replaces the previous single commit,
-          # keeping the branch at exactly one commit regardless of how many times
-          # the workflow runs.
+          # Orphan commit = no parent, so gh-pages never accumulates history
           git checkout --orphan gh-pages-deploy
           git rm -rf . --quiet
-
           cp -r "$DEPLOY_DIR/." .
           git add .
           git commit -m "deploy: $(date -u '+%Y-%m-%d %H:%M UTC')"
