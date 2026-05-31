@@ -1,0 +1,44 @@
+name: Update Satellite Data
+
+on:
+  repository_dispatch:
+    types: [satellite_update] # This is the event type cron-job.org will send
+  workflow_dispatch:      # Keeps the manual trigger from GitHub UI
+  # schedule:
+  #   - cron: '0 * * * *'  # Commented out so it relies purely on cron-job.org
+
+permissions:
+  contents: write  # Needed to commit updated images back to the repo
+
+jobs:
+  update-satellite:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libproj-dev proj-data proj-bin libgeos-dev
+
+      - name: Install Python Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate Satellite Images
+        run: python process_data.py
+
+      - name: Commit and Push Images to Repository
+        run: |
+          git config user.name  "GitHub Actions Bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add site/data/
+          # Only commit if something actually changed
+          git diff --staged --quiet || git commit -m "chore: update satellite images [$(date -u '+%Y-%m-%d %H:%M UTC')]"
+          git push
