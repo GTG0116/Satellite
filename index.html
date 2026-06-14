@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>GOES-19 Satellite Viewer</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body { margin: 0; padding: 0; background: #1a1a2e; }
+        #map { position: absolute; top: 0; bottom: 0; width: 100%; }
+
+        /* Disable browser bilinear smoothing on satellite image overlays */
+        .leaflet-overlay-pane img {
+            image-rendering: pixelated;
+            image-rendering: crisp-edges; /* Firefox fallback */
+        }
+
+        #timestamp {
+            position: absolute;
+            bottom: 58px;
+            left: 10px;
+            z-index: 1000;
+            background: rgba(0,0,0,0.6);
+            color: #fff;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 12px;
+        }
+
+        #frame-indicator {
+            position: absolute;
+            bottom: 30px;
+            left: 10px;
+            z-index: 1000;
+            background: rgba(0,0,0,0.6);
+            color: #7cf;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 12px;
+        }
+
+        /* ---- Legend panel ---- */
+        #legend {
+            position: absolute;
+            bottom: 30px;
+            right: 10px;
+            z-index: 1000;
+            background: rgba(0,0,0,0.72);
+            color: #fff;
+            padding: 10px 14px 8px;
+            border-radius: 6px;
+            font-family: sans-serif;
+            font-size: 12px;
+            min-width: 220px;
+            display: none;
+        }
+        #legend .legend-title {
+            font-size: 13px;
+            font-weight: bold;
+            margin-bottom: 7px;
+            letter-spacing: 0.02em;
+        }
+        #legend .legend-subtitle {
+            font-size: 10px;
+            color: #bbb;
+            margin-bottom: 6px;
+        }
+        #legend .legend-bar {
+            height: 14px;
+            border-radius: 3px;
+            margin-bottom: 3px;
+        }
+        #legend .legend-ticks {
+            display: flex;
+            justify-content: space-between;
+            font-size: 10px;
+            color: #ccc;
+            margin-bottom: 4px;
+        }
+        #legend .legend-unit {
+            font-size: 10px;
+            color: #aaa;
+            text-align: right;
+        }
+
+        /* Swatch rows used by the GeoColor night legend */
+        #legend .swatch-row {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            margin-bottom: 4px;
+            font-size: 11px;
+        }
+        #legend .swatch {
+            width: 14px;
+            height: 14px;
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div id="timestamp">Loading...</div>
+    <div id="frame-indicator">▶ LIVE</div>
+    <div id="legend"></div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // Initialize Map — centered on continental US
+        var map = L.map('map').setView([37, -95], 4);
+
+        // Dark base layer
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>',
+            subdomains: 'abcd',
+            maxZoom: 19
+        }).addTo(map);
+
+        // Image bounds — MUST match EXTENT in process_data.py: [-135, -60, 20, 55]
+        // Leaflet format: [[south, west], [north, east]]
+        var imageBounds = [[20, -135], [55, -60]];
+        var imageUrl = 'data/';
+
+        // Satellite overlay layers — always show the latest frame (_00)
+        var geocolorLayer   = L.imageOverlay(imageUrl + 'geocolor_00.png',    imageBounds, {opacity: 0.95});
+        var visibleLayer    = L.imageOverlay(imageUrl + 'visible_00.png',     imageBounds, {opacity: 0.85});
+        var infraredLayer   = L.imageOverlay(imageUrl + 'infrared_00.png',    imageBounds, {opacity: 0.85});
+        var waterVaporLayer = L.imageOverlay(imageUrl + 'water_vapor_00.png', imageBounds, {opacity: 0.85});
+
+        var overlayMaps = {
+            "GeoColor (RGB)":       geocolorLayer,
+            "Visible (Band 2)":     visibleLayer,
+            "Infrared (Band 13)":   infraredLayer,
+            "Water Vapor (Band 9)": waterVaporLayer
+        };
+
+        L.control.layers({}, overlayMaps, {collapsed: false}).addTo(map);
+
+        // Show GeoColor by default
+        geocolorLayer.addTo(map);
+
+        // ----------------------------------------------------------------
+        // Legend definitions
+        // ----------------------------------------------------------------
+
+        var LEGENDS = {
+            // Matches _ir_colormap() in process_data.py (190 – 310 K)
+            infrared: {
+                title: 'Infrared — Band 13',
+                subtitle: 'Clean IR Longwave (10.35 µm)',
+                gradient: 'linear-gradient(to right,' +
+                    '#ffffff 0%,'   +   // 190 K
+                    '#dd00dd 7%,'   +   // ~199 K
+                    '#ff0000 17%,'  +   // ~210 K
+                    '#ff5500 27%,'  +   // ~222 K
+                    '#ff8800 37%,'  +   // ~233 K  orange
+                    '#44cc00 45%,'  +   // ~244 K  green (no yellow)
+                    '#00cc00 53%,'  +   // ~254 K
+                    '#00cccc 62%,'  +   // ~264 K
+                    '#0066ff 72%,'  +   // ~276 K
+                    '#001177 87%,'  +   // ~294 K
+                    '#060606 100%'  +   // 310 K
+                ')',
+                ticks: ['190 K', '222 K', '254 K', '282 K', '310 K'],
+                unit: 'Brightness Temperature'
+            },
+
+            // Matches _wv_colormap() in process_data.py (195 – 280 K)
+            watervapor: {
+                title: 'Water Vapor — Band 9',
+                subtitle: 'Mid-Level Water Vapor (6.95 µm)',
+                gradient: 'linear-gradient(to right,' +
+                    '#00003c 0%,'   +   // 195 K
+                    '#0000cc 18%,'  +   // ~210 K
+                    '#0066ee 35%,'  +   // ~225 K
+                    '#00bbdd 50%,'  +   // ~238 K
+                    '#00bb66 63%,'  +   // ~249 K
+                    '#22cc00 74%,'  +   // ~258 K  green (no yellow-green)
+                    '#ff8800 84%,'  +   // ~266 K  orange (no yellow)
+                    '#ff5500 92%,'  +   // ~272 K
+                    '#cc1100 100%'  +   // 280 K
+                ')',
+                ticks: ['195 K', '217 K', '238 K', '259 K', '280 K'],
+                unit: 'Brightness Temperature'
+            },
+
+            // Grayscale visible
+            visible: {
+                title: 'Visible — Band 2',
+                subtitle: 'Red Visible (0.64 µm)',
+                gradient: 'linear-gradient(to right, #000000, #ffffff)',
+                ticks: ['0 %', '25 %', '50 %', '75 %', '100 %'],
+                unit: 'Reflectance'
+            },
+
+            // GeoColor: informational swatches (no single numeric scale)
+            geocolor: null
+        };
+
+        function buildLegend(key) {
+            var el = document.getElementById('legend');
+            if (key === 'geocolor' || !LEGENDS[key]) {
+                el.style.display = 'none';
+                return;
+            }
+            var d = LEGENDS[key];
+            var html = '<div class="legend-title">' + d.title + '</div>';
+            if (d.subtitle) html += '<div class="legend-subtitle">' + d.subtitle + '</div>';
+            html += '<div class="legend-bar" style="background:' + d.gradient + '"></div>';
+            html += '<div class="legend-ticks">';
+            d.ticks.forEach(function(t) { html += '<span>' + t + '</span>'; });
+            html += '</div>';
+            if (d.unit) html += '<div class="legend-unit">' + d.unit + '</div>';
+            el.innerHTML = html;
+            el.style.display = 'block';
+        }
+
+        // Priority order when multiple layers are active: IR > WV > Visible > GeoColor
+        var legendPriority = [
+            { layer: infraredLayer,   key: 'infrared'   },
+            { layer: waterVaporLayer, key: 'watervapor' },
+            { layer: visibleLayer,    key: 'visible'    },
+            { layer: geocolorLayer,   key: 'geocolor'   }
+        ];
+
+        function updateLegend() {
+            for (var i = 0; i < legendPriority.length; i++) {
+                if (map.hasLayer(legendPriority[i].layer)) {
+                    buildLegend(legendPriority[i].key);
+                    return;
+                }
+            }
+            document.getElementById('legend').style.display = 'none';
+        }
+
+        // ----------------------------------------------------------------
+        // Frame animation — cycles through the 10-frame rolling buffer
+        // Frame 00 = newest (LIVE), Frame 09 = oldest (~9 h ago)
+        // Plays oldest→newest then loops: 9, 8, 7, …, 1, 0, 9, 8, …
+        // ----------------------------------------------------------------
+        var NUM_FRAMES    = 10;
+        var currentFrame  = NUM_FRAMES - 1;   // start at oldest
+
+        var layerProducts = [
+            { layer: geocolorLayer,   product: 'geocolor'    },
+            { layer: visibleLayer,    product: 'visible'     },
+            { layer: infraredLayer,   product: 'infrared'    },
+            { layer: waterVaporLayer, product: 'water_vapor' }
+        ];
+
+        function frameUrl(product, index) {
+            var pad = index < 10 ? '0' + index : '' + index;
+            return 'data/' + product + '_' + pad + '.png';
+        }
+
+        function updateAnimationFrame() {
+            layerProducts.forEach(function(lp) {
+                if (map.hasLayer(lp.layer)) {
+                    lp.layer.setUrl(frameUrl(lp.product, currentFrame));
+                }
+            });
+            var ind = document.getElementById('frame-indicator');
+            if (currentFrame === 0) {
+                ind.textContent = '▶ LIVE';
+                ind.style.color = '#7cf';
+            } else {
+                ind.textContent = '▶ -' + currentFrame + 'h';
+                ind.style.color = '#fa8';
+            }
+        }
+
+        setInterval(function() {
+            // Advance one step older→newer; wrap newest back to oldest
+            currentFrame = (currentFrame - 1 + NUM_FRAMES) % NUM_FRAMES;
+            updateAnimationFrame();
+        }, 1000);
+
+        map.on('layeradd layerremove', function(e) {
+            updateLegend();
+            // Ensure newly-added layers immediately show the current animation frame
+            layerProducts.forEach(function(lp) {
+                if (e.layer === lp.layer) {
+                    lp.layer.setUrl(frameUrl(lp.product, currentFrame));
+                }
+            });
+        });
+
+        // Set initial legend for the default GeoColor layer (no legend shown)
+        updateLegend();
+
+        // ----------------------------------------------------------------
+        // Timestamp
+        // ----------------------------------------------------------------
+        fetch('data/last_updated.txt?nocache=' + Date.now())
+            .then(r => r.text())
+            .then(t => { document.getElementById('timestamp').textContent = 'Updated: ' + t; })
+            .catch(() => { document.getElementById('timestamp').textContent = 'Timestamp unavailable'; });
+    </script>
+</body>
+</html>
