@@ -10,7 +10,7 @@ import os
 from datetime import datetime, timezone, timedelta
 from botocore import UNSIGNED
 from botocore.config import Config
-from scipy.ndimage import zoom, uniform_filter
+from scipy.ndimage import zoom, uniform_filter, gaussian_filter
 
 OUTPUT_DIR = 'site/data'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -45,11 +45,33 @@ PRECIP_MIN_RATE = 0.01
 # Hydro-Estimator applies a similar cap.
 PRECIP_MAX_RATE = 4.0
 # Cloud-top temperatures warmer than this are assumed non-precipitating.
-PRECIP_CLOUD_MAX_K = 260.0
+# Raised from 260 K: comparison against live MRMS showed the old cut removing
+# most of the stratiform rain shield, whose tops sit in the 255–268 K range.
+PRECIP_CLOUD_MAX_K = 270.0
 # Diameter (km) of the neighbourhood used for the cloud-top texture test.
 PRECIP_TEXTURE_KM = 100.0
 # Minutes of GLM lightning accumulated for the deep-convection confirmation.
 PRECIP_GLM_MINUTES = 15
+
+# Gaussian smoothing (km, 1-sigma) applied to the finished rate field.  The
+# per-pixel screens are noisy at the 2 km sampling of Band 13, and against a
+# discrete colour scale that noise renders as salt-and-pepper speckle that no
+# real rain field exhibits.  Rain rate is coherent on ~10 km scales, so
+# smoothing at this length recovers the texture of a radar mosaic without
+# blurring away convective cores.
+PRECIP_SMOOTH_KM = 6.0
+
+# Correct the apparent position of cloud tops for viewing parallax.  A cold top
+# 12 km up is displaced ~15–25 km away from the satellite sub-point over the
+# mid-latitude CONUS, which shifts the estimate north of the rain it implies.
+PRECIP_PARALLAX = True
+# Surface temperature and lapse rate used to turn cloud-top brightness
+# temperature into a cloud-top height for the parallax shift.  A standard
+# tropospheric lapse rate is accurate enough: an error of 1 km in height moves
+# the correction by only ~1 km on the ground.
+PRECIP_SFC_TEMP_K   = 288.0
+PRECIP_LAPSE_K_PER_KM = 6.5
+PRECIP_MAX_CLOUD_KM = 16.0
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +185,26 @@ def _auto_estimator_rate(bt):
     return AE_A * np.exp(-AE_B * np.power(bt, AE_P))
 
 
-def _texture_factor(bt13, km_per_px):
+def _cloud_anomaly(bt13, km_per_px):
+    """Cloud-top temperature anomaly relative to the surrounding cloud, K.
+
+    Positive = this pixel is *colder* than the cloudy pixels around it, i.e. a
+    locally towering top.  Negative = warmer than its surroundings, the
+    signature of anvil that has spread downwind of the core that produced it.
+    """
+    size = int(round(PRECIP_TEXTURE_KM / max(km_per_px, 0.5)))
+    size = max(3, size | 1)  # odd window, at least 3 px
+
+    cloud = (bt13 < PRECIP_CLOUD_MAX_K).astype(np.float32)
+    # Mean over cloudy pixels only — clear-sky warmth must not dilute the mean.
+    bt_sum = uniform_filter(np.where(cloud > 0, bt13, 0.0).astype(np.float32), size=size)
+    bt_cnt = uniform_filter(cloud, size=size)
+    local_mean = np.where(bt_cnt > 1e-6, bt_sum / np.maximum(bt_cnt, 1e-6), bt13)
+
+    return (local_mean - bt13).astype(np.float32)
+
+
+def _texture_factor(anomaly):
     """Convective-core vs. cirrus-anvil weighting from cloud-top texture.
 
     The raw regression assigns rain to any cold pixel, so a wide cirrus anvil
@@ -178,17 +219,6 @@ def _texture_factor(bt13, km_per_px):
     same signal.  Returns ~0.1 for warm-relative anvil rising to 1.0 at and
     below the local cloud mean.
     """
-    size = int(round(PRECIP_TEXTURE_KM / max(km_per_px, 0.5)))
-    size = max(3, size | 1)  # odd window, at least 3 px
-
-    cloud = (bt13 < PRECIP_CLOUD_MAX_K).astype(np.float32)
-    # Mean over cloudy pixels only — clear-sky warmth must not dilute the mean.
-    bt_sum = uniform_filter(np.where(cloud > 0, bt13, 0.0).astype(np.float32), size=size)
-    bt_cnt = uniform_filter(cloud, size=size)
-    local_mean = np.where(bt_cnt > 1e-6, bt_sum / np.maximum(bt_cnt, 1e-6), bt13)
-
-    # Positive anomaly = colder than surroundings = likely active core
-    anomaly = local_mean - bt13
     return np.interp(anomaly, [-6.0, -2.0, 0.0],
                               [0.10, 0.55, 1.00]).astype(np.float32)
 
@@ -214,6 +244,78 @@ def _wv_factor(bt13, bt_wv):
                            [0.05, 0.25, 0.85, 1.00, 1.00, 0.00]).astype(np.float32)
 
 
+def _stratiform_rate(bt13, bt15=None):
+    """Light stratiform rain rate, mm/hr, for thick non-convective cloud.
+
+    The Auto-Estimator regression is calibrated on convective rainfall and
+    falls off so steeply with temperature that it is already below the display
+    threshold by ~248 K — a 250 K top scores 0.14 mm/hr, which rounds to no
+    rain at all.  Side-by-side with a live MRMS mosaic that is the dominant
+    error: a broad synoptic rain shield producing a solid 20–35 dBZ echo over
+    several states has tops in the 240–265 K band and disappears entirely,
+    leaving only the scattered cold cores behind and a rain *area* several
+    times too small.
+
+    This adds a second, much flatter branch for that regime — a nimbostratus /
+    thick altostratus deck raining lightly but steadily.  The rates are the
+    light half of the scale by construction (roughly 0.01–0.20 in/hr from 265 K
+    down to 220 K) so that the branch fills in coverage without competing with
+    the convective curve where that curve is actually skilful.
+
+    The one screen that matters here is optical thickness.  Cloud that lets the
+    12.3 µm channel see part of the warm surface below is too thin to be
+    raining, and thin cirrus is exactly the population this branch would
+    otherwise turn into a huge false rain shield.
+    """
+    # Anchored against Marshall-Palmer (Z = 200·R^1.6) rates for the
+    # reflectivities a synoptic rain shield actually produces: 20 dBZ ≈ 0.6,
+    # 25 dBZ ≈ 1.3 and 30 dBZ ≈ 2.7 mm/hr.
+    rate = np.interp(bt13, [215.0, 230.0, 240.0, 250.0, 260.0, 268.0, 272.0],
+                           [  7.0,   4.5,   2.8,   1.5,   0.6,   0.12,  0.0])
+
+    if bt15 is not None:
+        # Same discriminator as _split_window_factor but applied harder: an
+        # opaque deck (BTD ≈ 0–2 K) rains, a semi-transparent one does not.
+        btd = bt13 - bt15
+        rate = rate * np.interp(btd, [1.5, 3.0, 5.0],
+                                     [1.0, 0.45, 0.03])
+
+    return rate.astype(np.float32)
+
+
+def _stratiform_wv_factor(bt13, bt_wv):
+    """Water-vapour screen sized for the stratiform branch.
+
+    _wv_factor() is built to isolate deep convection, so it penalises any cloud
+    whose top sits well below the level Band 9 senses.  A mid-level raining
+    deck legitimately reads 15–25 K colder in the water-vapour channel than in
+    the window channel, and the convective screen would throw most of it away.
+
+    This keeps the two genuine rejections and drops the deep-convection
+    preference in between:
+
+      • Very negative — Band 9 is sensing cold upper-tropospheric moisture far
+        above a thin or broken cloud, so there is no thick deck here.
+      • Positive — the window channel is colder than the mid-troposphere, which
+        is a cold *surface* (snow pack, high terrain), not a cloud at all.
+    """
+    diff = bt_wv - bt13
+    return np.interp(diff, [-45.0, -30.0, -18.0, -2.0, 2.0, 8.0],
+                           [  0.0,   0.35,   0.9,  1.0, 1.0, 0.0]).astype(np.float32)
+
+
+def _stratiform_texture_factor(anomaly):
+    """Mild anvil penalty for the stratiform branch.
+
+    A stratiform deck is by definition smooth, so the convective texture test
+    would score all of it as spreading anvil and suppress it by 10×.  Only the
+    strongly warm-relative tail — the thin outflow cirrus streaming off the
+    downwind edge of a storm — is penalised here, and never below a third.
+    """
+    return np.interp(anomaly, [-12.0, -5.0, 0.0],
+                              [  0.30,  0.70, 1.00]).astype(np.float32)
+
+
 def _split_window_factor(bt13, bt15):
     """Thin-cirrus screen from the split-window difference (Band 13 − Band 15).
 
@@ -237,6 +339,38 @@ def _split_window_factor(bt13, bt15):
                           [1.00, 0.70, 0.10]).astype(np.float32)
 
 
+def _view_geometry(x, y):
+    """Per-pixel viewing geometry for the geostationary grid.
+
+    x, y are projection coordinates in metres (scan angle × satellite height).
+    Broadcasts the 1-D axes rather than meshgrid, which would allocate two full
+    copies of the grid.
+
+    Returns (scan, zenith_rad, slant_m):
+      scan       – angular distance from nadir along the line of sight, rad
+      zenith_rad – satellite zenith angle at the surface point, rad
+      slant_m    – satellite-to-surface distance, m
+    """
+    xs = np.asarray(x, dtype=np.float32)[None, :] / GOES_SAT_HEIGHT
+    ys = np.asarray(y, dtype=np.float32)[:, None] / GOES_SAT_HEIGHT
+    scan = np.sqrt(xs * xs + ys * ys)
+
+    # Law of sines on the satellite–Earth-centre–pixel triangle:
+    #   sin(scan) = (R_e / (R_e + h)) · sin(zenith)
+    ratio = (EARTH_RADIUS + GOES_SAT_HEIGHT) / EARTH_RADIUS
+    s = np.clip(np.sin(scan) * ratio, -1.0, 1.0)  # >1 would be off-earth
+    zenith = np.arcsin(s)
+
+    # Ray–sphere intersection for the slant range.  Off-earth pixels give a
+    # negative discriminant; clamp so the result stays finite (those pixels are
+    # masked out elsewhere anyway).
+    r_sat = EARTH_RADIUS + GOES_SAT_HEIGHT
+    disc  = EARTH_RADIUS ** 2 - (r_sat * np.sin(scan)) ** 2
+    slant = r_sat * np.cos(scan) - np.sqrt(np.maximum(disc, 0.0))
+
+    return scan.astype(np.float32), zenith.astype(np.float32), slant.astype(np.float32)
+
+
 def _view_angle_factor(x, y):
     """Taper the estimate to zero towards the limb of the disk.
 
@@ -246,22 +380,87 @@ def _view_angle_factor(x, y):
     satellite zenith angle the retrieval is not usable.  The CONUS sector sits
     well inside that limit, so in practice this is a no-op guard rather than a
     visible taper — it only matters if the domain is ever widened.
-
-    x, y are projection coordinates in metres (scan angle × satellite height).
     """
-    # Angular distance from nadir along the scan, in radians.  Broadcast the
-    # 1-D axes rather than meshgrid, which would allocate two full copies.
-    xs = np.asarray(x, dtype=np.float32)[None, :] / GOES_SAT_HEIGHT
-    ys = np.asarray(y, dtype=np.float32)[:, None] / GOES_SAT_HEIGHT
-    scan = np.sqrt(xs * xs + ys * ys)
+    _, zenith, _ = _view_geometry(x, y)
+    return np.interp(np.degrees(zenith), [65.0, 75.0],
+                                         [1.0, 0.0]).astype(np.float32)
 
-    # Law of sines on the satellite–Earth-centre–pixel triangle:
-    #   sin(scan) = (R_e / (R_e + h)) · sin(zenith)
-    ratio = (EARTH_RADIUS + GOES_SAT_HEIGHT) / EARTH_RADIUS
-    s = np.clip(np.sin(scan) * ratio, -1.0, 1.0)  # >1 would be off-earth
-    zenith = np.degrees(np.arcsin(s))
 
-    return np.interp(zenith, [65.0, 75.0], [1.0, 0.0]).astype(np.float32)
+def _parallax_correct(rate, bt13, x, y, km_per_px):
+    """Move the estimate from the cloud top down to the ground beneath it.
+
+    Infrared assigns each pixel the position where the *cloud top* intersects
+    the line of sight, not the point on the ground below it.  Seen from the
+    equator at 75.2°W, a 12 km top over the mid-Atlantic is displaced roughly
+    15–25 km away from the sub-satellite point — northward over the CONUS —
+    so an uncorrected estimate lands consistently north of the rain it is
+    predicting.  That offset is a large fraction of the width of a squall line
+    and is plainly visible when the product is overlaid on a radar mosaic.
+
+    The displacement is radial in the projection plane (the sub-satellite point
+    sits at the origin) with a ground magnitude of h·tan(zenith), so the
+    correction is a move along that radius.  Cloud-top height comes from
+    brightness temperature via a standard lapse rate.
+
+    The move is a forward scatter rather than a backward resample: how far a
+    pixel travels depends on the height of the cloud *at that pixel*, which a
+    backward pass cannot know — it would read the height at the destination,
+    which for the leading edge of a storm is clear sky, and leave the edge
+    behind.  Colliding pixels keep the larger rate, and the caller smooths
+    afterwards, which closes the sub-pixel gaps a scatter opens up where the
+    shift field stretches.
+    """
+    xs = np.asarray(x, dtype=np.float64)
+    ys = np.asarray(y, dtype=np.float64)
+    if xs.size < 2 or ys.size < 2:
+        return rate
+
+    _, zenith, slant = _view_geometry(xs, ys)
+
+    # Cloud-top height from brightness temperature, km → m.
+    h = np.clip((PRECIP_SFC_TEMP_K - bt13) / PRECIP_LAPSE_K_PER_KM,
+                0.0, PRECIP_MAX_CLOUD_KM) * 1000.0
+
+    # Ground displacement of the apparent position, away from nadir.
+    shift_m = h * np.tan(np.minimum(zenith, np.radians(80.0)))
+
+    # Ground sample distance along the radial direction.  A pixel subtends a
+    # fixed scan angle, so its footprint grows both with slant range and with
+    # the obliquity of the surface: gsd = nadir_gsd · (slant/H) / cos(zenith).
+    gsd_m = (km_per_px * 1000.0) * (slant / GOES_SAT_HEIGHT) / \
+            np.maximum(np.cos(zenith), 0.2)
+
+    n_px = shift_m / np.maximum(gsd_m, 1.0)
+
+    # Unit vector pointing away from nadir in the projection plane.
+    r = np.sqrt(xs[None, :] ** 2 + ys[:, None] ** 2)
+    r = np.maximum(r, 1.0)
+    ux = xs[None, :] / r
+    uy = ys[:, None] / r
+
+    # Only the raining pixels need moving, which keeps the scatter cheap.
+    wet = rate > 0
+    if not wet.any():
+        return rate
+
+    ny, nx = rate.shape
+    rows, cols = np.nonzero(wet)
+
+    # Column index increases with x, so a step towards nadir (−x) is a negative
+    # column step.  The y axis runs top-down (y[0] is the northern edge), so a
+    # −y step is a *positive* row step — carry the sign of the y spacing so the
+    # code stays correct if a grid is ever stored the other way up.
+    row_sign = np.sign(float(ys[1] - ys[0]))
+    n = n_px[rows, cols]
+    dst_col = np.rint(cols - n * ux[0, cols]).astype(np.int64)
+    dst_row = np.rint(rows - n * uy[rows, 0] * row_sign).astype(np.int64)
+
+    keep = (dst_row >= 0) & (dst_row < ny) & (dst_col >= 0) & (dst_col < nx)
+    out = np.zeros_like(rate)
+    np.maximum.at(out.reshape(-1),
+                  dst_row[keep] * nx + dst_col[keep],
+                  rate[rows[keep], cols[keep]])
+    return out
 
 
 def fetch_glm_flashes(s3_client, minutes=PRECIP_GLM_MINUTES, max_files=60):
@@ -372,7 +571,7 @@ def glm_confidence(lats, lons, x, y, goes_proj, km_per_px):
                               [0.0, 0.50, 1.00]).astype(np.float32)
 
 
-def _cooling_factor(bt13, bt13_prev, minutes):
+def _cooling_factor(bt13, bt13_prev, minutes, km_per_px=2.0):
     """Growth-rate weighting from the cloud-top temperature trend.
 
     A cooling top is a rising, still-building updraught and rains hardest; a
@@ -384,6 +583,16 @@ def _cooling_factor(bt13, bt13_prev, minutes):
     Weighted towards growth rather than symmetric about zero: sustained deep
     convection cools its top continuously while it builds, so a top that has
     stopped cooling is usually already past its peak.
+
+    The two scans are half an hour apart, over which the cloud field advects
+    tens of kilometres, so a raw pixel-by-pixel difference is dominated by the
+    edge of the cloud sweeping across the pixel rather than by the top actually
+    changing temperature.  That produces a sharp dipole of large positive and
+    negative differences along every cloud boundary, and — because the factor
+    used to reach as low as 0.2 — punched holes straight through otherwise
+    solid rain areas.  Smoothing the trend over roughly the distance the field
+    advects, and limiting how far the factor can suppress, keeps the real
+    growth/decay signal while removing that artefact.
     """
     if bt13_prev is None or minutes <= 0 or bt13_prev.shape != bt13.shape:
         return 1.0
@@ -391,8 +600,10 @@ def _cooling_factor(bt13, bt13_prev, minutes):
     # Normalise the trend to K per 15 minutes so the thresholds below are
     # independent of the actual gap between the two scans.
     trend = (bt13 - bt13_prev) * (15.0 / minutes)
+    trend = gaussian_filter(trend.astype(np.float32),
+                            sigma=max(1.0, 15.0 / max(km_per_px, 0.5)))
     return np.interp(trend, [-8.0, -2.0, 0.0, 2.0, 6.0],
-                            [1.20, 1.05, 0.85, 0.50, 0.20]).astype(np.float32)
+                            [1.20, 1.05, 0.90, 0.70, 0.50]).astype(np.float32)
 
 
 def estimate_precip_rate(bt13, bt_wv=None, bt13_prev=None,
@@ -401,20 +612,32 @@ def estimate_precip_rate(bt13, bt_wv=None, bt13_prev=None,
     """Estimate surface rain rate (in/hr) from ABI infrared brightness temps.
 
     EXPERIMENTAL.  Infrared sees cloud *tops*, not raindrops, so this is an
-    inference chain rather than a measurement.  Known limitations:
+    inference chain rather than a measurement.
+
+    Two branches are summed:
+
+      • Convective — the Auto-Estimator curve gated hard by the deep-convection
+        screens (texture, water vapour, split window, cooling trend, GLM).
+        Skilful for cores, produces nothing at all outside them.
+      • Stratiform — a flat, light curve for optically thick cloud in the
+        240–268 K range, gated mainly by optical thickness.  This is what fills
+        in the broad synoptic rain shield that the convective branch cannot
+        see, and it is the difference between a scatter of isolated blobs and
+        a continuous rain area.
+
+    Known limitations:
 
       • Warm rain from shallow maritime clouds is invisible — those tops are
         warmer than PRECIP_CLOUD_MAX_K and are scored as zero.
-      • The result is therefore biased towards the convective part of the rain
-        field.  Light stratiform rain falling from tops in the 240–260 K range
-        is scored below the display threshold and simply disappears, so the
-        rain area is too small and the surviving area skews heavy.  Read this
-        as "where is the deep convection and roughly how hard is it", not as a
-        complete rainfall map.
       • Cold cirrus that is not raining can still be scored as rain when the
-        texture and water-vapour screens fail to catch it.
-      • No parallax correction, so cold tops are displaced from the rain
-        beneath them by tens of km at the northern edge of the domain.
+        texture, water-vapour and split-window screens all fail to catch it.
+      • The stratiform branch keys on cold, optically thick cloud, and a deep
+        cold-season snow pack under clear skies can mimic that: the surface is
+        cold enough to pass the temperature test and there is no thin-cloud
+        signature to reject.  Treat cold-season output over snow-covered
+        terrain with suspicion.
+      • The parallax correction assumes a fixed lapse rate, so cloud-top height
+        — and therefore the size of the shift — is only good to a few km.
       • The Auto-Estimator regression was fitted over the continental US in
         summer; it over-predicts in dry environments and under-predicts in
         moist tropical ones.  The operational Hydro-Estimator corrects this
@@ -443,18 +666,24 @@ def estimate_precip_rate(bt13, bt_wv=None, bt13_prev=None,
                          bt13_f.shape[1] / a.shape[1]), order=1)
         return a
 
+    wv_bt    = _match(bt_wv) if bt_wv is not None else None
+    split_bt = _match(bt_split) if bt_split is not None else None
+    anomaly  = _cloud_anomaly(bt13_f, km_per_px)
+
+    # --- Convective branch -------------------------------------------------
     # The screens are accumulated separately from the rate curve so that
     # lightning can raise the floor on all of them at once (below).
-    screen = _texture_factor(bt13_f, km_per_px)
+    screen = _texture_factor(anomaly)
 
-    if bt_wv is not None:
-        screen = screen * _wv_factor(bt13_f, _match(bt_wv))
+    if wv_bt is not None:
+        screen = screen * _wv_factor(bt13_f, wv_bt)
 
-    if bt_split is not None:
-        screen = screen * _split_window_factor(bt13_f, _match(bt_split))
+    if split_bt is not None:
+        screen = screen * _split_window_factor(bt13_f, split_bt)
 
     if bt13_prev is not None:
-        screen = screen * _cooling_factor(bt13_f, _match(bt13_prev), prev_minutes)
+        screen = screen * _cooling_factor(bt13_f, _match(bt13_prev),
+                                          prev_minutes, km_per_px)
 
     if glm_conf is not None:
         # Lightning is direct evidence of deep convection, so it overrides the
@@ -464,6 +693,16 @@ def estimate_precip_rate(bt13, bt_wv=None, bt13_prev=None,
         screen = np.maximum(screen, _match(glm_conf, fill=0.0))
 
     rate = _auto_estimator_rate(bt13_f) * screen
+
+    # --- Stratiform branch -------------------------------------------------
+    strat = _stratiform_rate(bt13_f, split_bt) * _stratiform_texture_factor(anomaly)
+    if wv_bt is not None:
+        strat = strat * _stratiform_wv_factor(bt13_f, wv_bt)
+
+    # Summed, not maximised: a convective core is embedded in the same deck
+    # that the stratiform branch is describing, and both are falling on the
+    # ground below it.  The clip at PRECIP_MAX_RATE keeps the sum bounded.
+    rate = rate + strat
 
     # Applied last: this is a data-quality mask, not a convection screen, so
     # not even lightning should reinstate rain in unusable limb geometry.
@@ -479,6 +718,19 @@ def estimate_precip_rate(bt13, bt_wv=None, bt13_prev=None,
 
     rate = np.clip(np.nan_to_num(rate, nan=0.0, posinf=PRECIP_MAX_RATE),
                    0.0, PRECIP_MAX_RATE)
+
+    # Shift the estimate from the cloud top to the ground beneath it.
+    if PRECIP_PARALLAX and x is not None and y is not None:
+        rate = _parallax_correct(rate.astype(np.float32), bt13_f, x, y, km_per_px)
+
+    # Smooth after the shift and before thresholding: it closes the sub-pixel
+    # gaps the scatter opens, and it means the cut to zero follows a coherent
+    # rain edge rather than carving speckle out of the interior of the field.
+    if PRECIP_SMOOTH_KM > 0:
+        sigma = PRECIP_SMOOTH_KM / max(km_per_px, 0.5)
+        if sigma > 0.5:
+            rate = gaussian_filter(rate.astype(np.float32), sigma=sigma)
+
     rate = np.where(rate < PRECIP_MIN_RATE, 0.0, rate)
     return rate.astype(np.float32)
 
@@ -1096,10 +1348,13 @@ def main():
     # GeoColor — natural colour (day) or IR+city-lights composite (night)
     process_geocolor(s3)
 
-    # Precipitation Rate — EXPERIMENTAL.  Band 13 cloud-top temperature run
-    # through the Vicente et al. (1998) Auto-Estimator regression, screened
-    # for deep convection with Bands 9 and 15, the 30-minute cooling trend,
-    # and GLM lightning.  Inference from cloud tops, not a radar measurement.
+    # Precipitation Rate — EXPERIMENTAL.  Two branches from Band 13 cloud-top
+    # temperature: the Vicente et al. (1998) Auto-Estimator regression for
+    # convective cores, screened with Bands 9 and 15, the 30-minute cooling
+    # trend and GLM lightning; plus a light stratiform branch for optically
+    # thick mid-level cloud, which is what the rain shield around those cores
+    # is made of.  Corrected for view parallax.  Inference from cloud tops,
+    # not a radar measurement.
     process_precip(s3)
 
     # Write a plain-text timestamp so the website can show freshness
