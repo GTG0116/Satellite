@@ -84,6 +84,14 @@
             color: #aaa;
             text-align: right;
         }
+        /* Caveat text for the experimental precipitation product */
+        #legend .legend-note {
+            font-size: 10px;
+            line-height: 1.35;
+            color: #f5b942;
+            margin-top: 6px;
+            max-width: 240px;
+        }
 
         /* Swatch rows used by the GeoColor night legend */
         #legend .swatch-row {
@@ -129,12 +137,14 @@
         var visibleLayer    = L.imageOverlay(imageUrl + 'visible_00.png',     imageBounds, {opacity: 0.85});
         var infraredLayer   = L.imageOverlay(imageUrl + 'infrared_00.png',    imageBounds, {opacity: 0.85});
         var waterVaporLayer = L.imageOverlay(imageUrl + 'water_vapor_00.png', imageBounds, {opacity: 0.85});
+        var precipLayer     = L.imageOverlay(imageUrl + 'precip_00.png',      imageBounds, {opacity: 0.90});
 
         var overlayMaps = {
             "GeoColor (RGB)":       geocolorLayer,
             "Visible (Band 2)":     visibleLayer,
             "Infrared (Band 13)":   infraredLayer,
-            "Water Vapor (Band 9)": waterVaporLayer
+            "Water Vapor (Band 9)": waterVaporLayer,
+            "⚡ Precip Rate (experimental)": precipLayer
         };
 
         L.control.layers({}, overlayMaps, {collapsed: false}).addTo(map);
@@ -146,7 +156,41 @@
         // Legend definitions
         // ----------------------------------------------------------------
 
+        // Discrete rain-rate scale — MUST match PRECIP_LEVELS / PRECIP_COLORS
+        // in process_data.py.
+        var PRECIP_BIN_COLORS = [
+            '#9fe8ff', '#4fc0f0', '#1878d0', '#17a92a', '#4fd12a',
+            '#ffe000', '#ff9000', '#ff3000', '#c00040', '#ff40ff'
+        ];
+
+        // Hard-stop gradient so each rain-rate bin reads as a discrete step
+        // rather than a continuous ramp.
+        function precipGradient() {
+            var stops = [];
+            var w = 100 / PRECIP_BIN_COLORS.length;
+            PRECIP_BIN_COLORS.forEach(function(c, i) {
+                stops.push(c + ' ' + (i * w).toFixed(1) + '%');
+                stops.push(c + ' ' + ((i + 1) * w).toFixed(1) + '%');
+            });
+            return 'linear-gradient(to right,' + stops.join(',') + ')';
+        }
+
         var LEGENDS = {
+            // Matches estimate_precip_rate() in process_data.py
+            precip: {
+                title: 'Precipitation Rate — experimental',
+                subtitle: 'Bands 13 + 9 + 15, with GLM lightning',
+                gradient: precipGradient(),
+                // Bin edges 0.01 / 0.05 / 0.20 / 0.75 / 2.00 / 4.00 fall at
+                // 0, 20, 40, 60, 80 and 100 % of the bar.
+                ticks: ['0.01', '0.05', '0.20', '0.75', '2.00', '4.00+'],
+                unit: 'in/hr',
+                note: 'Inferred from cloud-top temperature — not a radar ' +
+                      'measurement. Misses warm rain from low cloud, so it ' +
+                      'reads as "where is the deep convection", not a full ' +
+                      'rainfall map.'
+            },
+
             // Matches _ir_colormap() in process_data.py (190 – 310 K)
             infrared: {
                 title: 'Infrared — Band 13',
@@ -214,12 +258,15 @@
             d.ticks.forEach(function(t) { html += '<span>' + t + '</span>'; });
             html += '</div>';
             if (d.unit) html += '<div class="legend-unit">' + d.unit + '</div>';
+            if (d.note) html += '<div class="legend-note">' + d.note + '</div>';
             el.innerHTML = html;
             el.style.display = 'block';
         }
 
-        // Priority order when multiple layers are active: IR > WV > Visible > GeoColor
+        // Priority order when multiple layers are active:
+        // Precip > IR > WV > Visible > GeoColor
         var legendPriority = [
+            { layer: precipLayer,     key: 'precip'     },
             { layer: infraredLayer,   key: 'infrared'   },
             { layer: waterVaporLayer, key: 'watervapor' },
             { layer: visibleLayer,    key: 'visible'    },
@@ -248,7 +295,8 @@
             { layer: geocolorLayer,   product: 'geocolor'    },
             { layer: visibleLayer,    product: 'visible'     },
             { layer: infraredLayer,   product: 'infrared'    },
-            { layer: waterVaporLayer, product: 'water_vapor' }
+            { layer: waterVaporLayer, product: 'water_vapor' },
+            { layer: precipLayer,     product: 'precip'      }
         ];
 
         function frameUrl(product, index) {
